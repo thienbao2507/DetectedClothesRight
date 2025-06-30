@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <title>Kết quả kiểm tra đồng phục</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 p-6 font-sans">
+<div class="text-center mb-8">
+  <h1 class="text-3xl font-bold text-gray-800">🎓 Kết quả kiểm tra đồng phục</h1>
+</div>
+
+<div class="flex gap-6">
+  <!-- CỘT TRÁI: Ảnh kết quả -->
+  <div class="w-1/5 bg-white shadow rounded-lg p-4">
+    <h2 class="text-lg font-semibold text-gray-700 mb-3">📷 Ảnh đã xử lý</h2>
+    <img src="{{ img_path }}" alt="Ảnh kết quả" class="rounded border border-gray-300" />
+  </div>
+
+  <!-- CỘT GIỮA: Icon kiểm tra -->
+ <div class="w-1/6 bg-[#FC942D] shadow rounded-lg p-4">
+    <h2 class="text-xl font-bold text-gray-800 mb-4">📋 KIỂM TRA</h2>
+
+    {% set total_fail = 0 %}
+    {% set status_gloves = [results['left_glove'], results['right_glove']] %}
+    {% set gloves_status = 'pass' if 'fail' not in status_gloves and 'missing' not in status_gloves else 'fail' %}
+    {% if gloves_status == 'fail' %} {% set total_fail = total_fail + 1 %} {% endif %}
+
+    {% set status_shoes = [results['left_shoe'], results['right_shoe']] %}
+    {% set shoes_status = 'pass' if 'fail' not in status_shoes and 'missing' not in status_shoes else 'fail' %}
+    {% if shoes_status == 'fail' %} {% set total_fail = total_fail + 1 %} {% endif %}
+
+    {% if results['nametag'] != 'pass' %} {% set total_fail = total_fail + 1 %} {% endif %}
+    {% if results['shirt'] != 'pass' %} {% set total_fail = total_fail + 1 %} {% endif %}
+    {% if results['pants'] != 'pass' %} {% set total_fail = total_fail + 1 %} {% endif %}
+
+    <p class="text-red-600 font-bold text-lg mb-4">Total Fail: {{ total_fail }}</p>
+
+    <div class="grid grid-cols-2 gap-6 justify-items-center">
+      <!-- ID -->
+      <div class="flex flex-col items-center">
+        <img src="{{ url_for('static', filename='icons/id-card.png') }}"
+             class="w-12 h-12 mb-1
+             {% if results['nametag'] == 'pass' %}
+                filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+             {% else %}
+                opacity-30
+             {% endif %}">
+        <span class="text-sm text-gray-700">ID</span>
+      </div>
+
+      <!-- Shirt -->
+      <div class="flex flex-col items-center">
+        <img src="{{ url_for('static', filename='icons/long-sleeve-shirt.png') }}"
+             class="w-12 h-12 mb-1
+             {% if results['shirt'] == 'pass' %}
+                filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+
+             {% else %}
+                opacity-30
+             {% endif %}">
+        <span class="text-sm text-gray-700">Shirt</span>
+      </div>
+
+      <!-- Gloves -->
+      <div class="flex flex-col items-center">
+        <img src="{{ url_for('static', filename='icons/gloves.png') }}"
+             class="w-12 h-12 mb-1
+             {% if gloves_status == 'pass' %}
+                filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+
+             {% else %}
+                opacity-30
+             {% endif %}">
+        <span class="text-sm text-gray-700">Gloves</span>
+      </div>
+
+      <!-- Shoes -->
+      <div class="flex flex-col items-center">
+        <img src="{{ url_for('static', filename='icons/sport-shoe.png') }}"
+             class="w-12 h-12 mb-1
+             {% if shoes_status == 'pass' %}
+                filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+
+             {% else %}
+                opacity-30
+             {% endif %}">
+        <span class="text-sm text-gray-700">Shoes</span>
+      </div>
+
+      <!-- Pants -->
+      <div class="flex flex-col items-center">
+        <img src="{{ url_for('static', filename='icons/pants.png') }}"
+             class="w-12 h-12 mb-1
+             {% if results['pants'] == 'pass' %}
+                filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+             {% else %}
+                opacity-30
+             {% endif %}">
+        <span class="text-sm text-gray-700">Pants</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- CỘT PHẢI: JSON -->
+  <div class="w-1/2 bg-white shadow rounded-lg p-4">
+    <h2 class="text-lg font-semibold text-gray-700 mb-3">📊 Kết quả JSON</h2>
+    <pre class="bg-gray-100 p-3 rounded text-sm text-gray-800 overflow-x-auto">{{ results | tojson(indent=2) }}</pre>
+  </div>
+</div>
+
+</body>
+</html>
