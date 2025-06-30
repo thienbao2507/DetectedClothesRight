@@ -1,3 +1,5 @@
+# process.py
+
 import os
 import cv2
 import json
@@ -5,107 +7,67 @@ import numpy as np
 import mediapipe as mp
 import tensorflow as tf
 from sklearn.metrics.pairwise import cosine_similarity
+import pickle
 
-# ==== ⚙️ CONFIG ====
-ANCHOR_IMAGE_PATH = "anchors_cropped/anchor_019.jpg"
+# ==============================================================================
+# ==== ⚙️ CONFIG (Cấu hình cho việc kiểm tra) ====
+# ==============================================================================
+GALLERY_FILE_PATH = "anchor_gallery.pkl"
 OUTPUT_FOLDER = "check"
 RESIZED_SHAPE = (512, 1024)
-THRESHOLD = 0.75
+# THAY ĐỔI: Thêm ngưỡng cho helmet
+THRESHOLDS = {
+    # "helmet": 0.80, # Ngưỡng cho mũ bảo hiểm
+    "shirt": 0.75,
+    "pants": 0.8,
+    "left_glove": 0.80,
+    "right_glove": 0.80,
+    "left_shoe": 0.70,
+    "right_shoe": 0.70,
+    "left_arm": 0.6,
+    "right_arm": 0.6,
+    "nametag": 0.65,
+    "default": 0.70
+}
+# THAY ĐỔI: Thêm "helmet" vào danh sách labels
+labels = [ "nametag", "shirt", "pants", "left_glove", "right_glove", "left_shoe", "right_shoe", "left_arm", "right_arm"]
+colors = {"pass": (0, 255, 0), "fail": (0, 0, 255), "missing": (128, 128, 128)}
 
-# ==== 📂 INIT ====
-os.makedirs(f"{OUTPUT_FOLDER}/anchor", exist_ok=True)
-os.makedirs(f"{OUTPUT_FOLDER}/test", exist_ok=True)
-
-# ==== 🧠 MODEL ====
-model = tf.keras.applications.MobileNetV2(include_top=False, weights='imagenet',
-                                          input_shape=(224, 224, 3), pooling='avg')
-
-
-def extract_embedding(image_path):
-    img = cv2.imread(image_path)
-    if img is None:
-        return None
-    img = cv2.resize(img, (224, 224))
+# ==============================================================================
+# ==== 🧠 HELPER FUNCTIONS (Các hàm xử lý cần thiết) ====
+# ==============================================================================
+def _preprocess_image_for_embedding(img):
+    """Hàm phụ để tiền xử lý ảnh trước khi đưa vào model."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l_eq = clahe.apply(l)
     lab_eq = cv2.merge((l_eq, a, b))
-    img = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+    img_rgb = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+    return tf.keras.applications.mobilenet_v2.preprocess_input(img_rgb)
 
-    img = tf.keras.applications.mobilenet_v2.preprocess_input(img)
-    img = np.expand_dims(img, axis=0)
-    return model.predict(img, verbose=0)
-
-
-# ==== 📦 LABELS + COLOR ====
-labels = ["nametag", "shirt", "pants", "left_glove", "right_glove",
-          "left_shoe", "right_shoe", "left_arm", "right_arm"]
-colors = {"pass": (0, 255, 0), "fail": (0, 0, 255), "missing": (128, 128, 128)}
-
-
-# ===NAMETAG===
-
-def detect_nametag_better(image_path, bright_threshold=170, ratio_thresh=0.04, area_thresh=400):
+def extract_embedding(image_path, model):
+    """Trích xuất embedding cho ảnh test, nhận model làm tham số."""
+    if not image_path or not os.path.exists(image_path): return None
     img = cv2.imread(image_path)
-    if img is None:
-        return "missing", None
+    if img is None: return None
+    img = cv2.resize(img, (224, 224))
+    processed_img = _preprocess_image_for_embedding(img)
+    return model.predict(np.expand_dims(processed_img, axis=0), verbose=0)
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, bright_threshold, 255, cv2.THRESH_BINARY)
-
-    white_ratio = np.sum(binary == 255) / binary.size
-    print(f"[Nametag] Bright pixel ratio: {white_ratio:.2%}")
-
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best_box = None
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area > area_thresh:
-            x, y, w, h = cv2.boundingRect(cnt)
-
-            # Cắt vùng nghi ngờ là thẻ
-            patch = gray[y:y + h, x:x + w]
-            if patch.size == 0:
-                continue
-
-            # Tính độ tương phản và mức độ tối trung tâm
-            center = patch[h // 4:3 * h // 4, w // 4:3 * w // 4]
-            dark_ratio = np.sum(center < 100) / center.size
-            contrast = np.std(patch)
-
-            print(f"[Nametag] Area: {area}, Contrast: {contrast:.1f}, Dark center ratio: {dark_ratio:.2f}")
-
-            if contrast > 20 and dark_ratio > 0.1:
-                best_box = (x, y, x + w, y + h)
-                break
-
-    if best_box:
-        return "pass", best_box
-    return "fail", None
-
-
-# ==== 📌 POSE CROP ====
 def crop_pose(image_path, save_folder):
+    """Cắt các bộ phận từ ảnh dựa trên các điểm pose."""
     image = cv2.imread(image_path)
+    if image is None: return {}, {}, None
     image = cv2.resize(image, RESIZED_SHAPE)
     h, w, _ = image.shape
     mp_pose = mp.solutions.pose
-    pose = mp_pose.Pose(static_image_mode=True)
-    results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    if not results.pose_landmarks:
-        print(f"❌ Không phát hiện người trong ảnh: {image_path}")
-        return {}, {}, image
-
+    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
+        results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    if not results.pose_landmarks: return {}, {}, image
     landmarks = results.pose_landmarks.landmark
-
-    def get_point(lm):
-        return int(lm.x * w), int(lm.y * h)
-
-    crops = {}
-    crop_paths = {}
-
+    def get_point(lm): return int(lm.x * w), int(lm.y * h)
+    crops, crop_paths = {}, {}
     def save_crop(label, x1, y1, x2, y2):
         if 0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h:
             crop = image[y1:y2, x1:x2]
@@ -114,207 +76,144 @@ def crop_pose(image_path, save_folder):
             crops[label] = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
             crop_paths[label] = path
 
-    # Điểm landmark chính
-    ls, rs = landmarks[11], landmarks[12]
-    lw, rw = landmarks[15], landmarks[16]
-    la, ra = landmarks[27], landmarks[28]
-    lh, rh = landmarks[23], landmarks[24]
+    # --- MỚI: Logic crop mũ bảo hiểm (đồng bộ với file create_anchor_gallery.py) ---
+    # head_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    # head_landmarks = [landmarks[i] for i in head_indices]
+    # head_xs = [int(l.x * w) for l in head_landmarks]
+    # head_ys = [int(l.y * h) for l in head_landmarks]
+    
+    # if head_xs and head_ys:
+    #     fx1, fy1 = min(head_xs), min(head_ys)
+    #     fx2, fy2 = max(head_xs), max(head_ys)
+    #     fh = fy2 - fy1
+    #     fw = fx2 - fx1
+        
+    #     helmet_x1 = fx1 - int(fw * 0.2)
+    #     helmet_y1 = fy1 - int(fh * 1.0)
+    #     helmet_x2 = fx2 + int(fw * 0.2)
+    #     helmet_y2 = fy2
+    #     save_crop("helmet", helmet_x1, helmet_y1, helmet_x2, helmet_y2)
 
-    # Nametag
-    x1, y1 = get_point(ls)
-    x2, y2 = get_point(rs)
-    cx1 = int((x1 + x2) * 0.5)
-    cx2 = max(x1, x2) + 20
-    cy1 = int((y1 + y2) * 0.5 + 0.08 * h)-20
-    cy2 = cy1 + 100 #độ dài
+    # --- Logic crop các bộ phận khác (giữ nguyên) ---
+    ls, rs = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER], landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+    lw, rw = landmarks[mp_pose.PoseLandmark.LEFT_WRIST], landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
+    la, ra = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE], landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
+    lh, rh = landmarks[mp_pose.PoseLandmark.LEFT_HIP], landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
+    
+    x1, y1 = get_point(ls); x2, y2 = get_point(rs)
+    cx1 = int((x1 + x2) * 0.5); cx2 = max(x1, x2) + 20
+    cy1 = int((y1 + y2) * 0.5 + 0.08 * h)-20; cy2 = cy1 + 100
     save_crop("nametag", cx1, cy1, cx2, cy2)
-
-    # Găng tay
     def crop_hand(label, ids):
         pts = [landmarks[i] for i in ids]
-        xs = [int(p.x * w) for p in pts]
-        ys = [int(p.y * h) for p in pts]
+        xs = [int(p.x * w) for p in pts]; ys = [int(p.y * h) for p in pts]
         margin_x, margin_y = 30, 50
         save_crop(label, min(xs) - margin_x, min(ys) - margin_y, max(xs) + margin_x, max(ys) + margin_y)
-
-    crop_hand("left_glove", [15, 17, 19, 21])
-    crop_hand("right_glove", [16, 18, 20, 22])
-
-    # Giày
+    crop_hand("left_glove", [mp_pose.PoseLandmark.LEFT_WRIST, mp_pose.PoseLandmark.LEFT_PINKY, mp_pose.PoseLandmark.LEFT_INDEX])
+    crop_hand("right_glove", [mp_pose.PoseLandmark.RIGHT_WRIST, mp_pose.PoseLandmark.RIGHT_PINKY, mp_pose.PoseLandmark.RIGHT_INDEX])
     for label, pt in zip(["left_shoe", "right_shoe"], [la, ra]):
         px, py = get_point(pt)
         save_crop(label, px - 50, py - 20, px + 50, py + 60)
-
-    # Áo
-    x_ls, y_ls = get_point(ls)
-    x_rs, y_rs = get_point(rs)
-    shirt_x1 = min(x_ls, x_rs) - 20
-    shirt_y1 = min(y_ls, y_rs) - 40
-    shirt_x2 = max(x_ls, x_rs) + 20
-    shirt_y2 = int((lh.y + rh.y) / 2 * h)
+    x_ls, y_ls = get_point(ls); x_rs, y_rs = get_point(rs)
+    shirt_x1 = min(x_ls, x_rs) - 20; shirt_y1 = min(y_ls, y_rs) - 40
+    shirt_x2 = max(x_ls, x_rs) + 20; shirt_y2 = int((lh.y + rh.y) / 2 * h)
     save_crop("shirt", shirt_x1, shirt_y1, shirt_x2, shirt_y2)
-
-    # Quần
-    lx, ly = get_point(lh)
-    rx, ry = get_point(rh)
+    lx, ly = get_point(lh); rx, ry = get_point(rh)
     ankle_y = max(get_point(la)[1], get_point(ra)[1])
     save_crop("pants", min(lx, rx) - 80, min(ly, ry), max(lx, rx) + 80, ankle_y + 40)
-
-    # Cánh tay
     for label, shoulder, wrist in zip(["left_arm", "right_arm"], [ls, rs], [lw, rw]):
-        sx, sy = get_point(shoulder)
-        wx, wy = get_point(wrist)
+        sx, sy = get_point(shoulder); wx, wy = get_point(wrist)
         save_crop(label, min(sx, wx) - 30, min(sy, wy) - 30, max(sx, wx) + 30, max(sy, wy) + 30)
-
     return crops, crop_paths, image
 
-
-# ==DeLoy==
-def run_inference(test_image_path):
-    # Tạo lại thư mục kết quả
-    os.makedirs(f"{OUTPUT_FOLDER}/anchor", exist_ok=True)
-    os.makedirs(f"{OUTPUT_FOLDER}/test", exist_ok=True)
-    box_errors = []
-
-    # ==== 📌 POSE CROP ====
-    print("🔧 Đang crop ảnh chuẩn...")
-    anchor_boxes, anchor_paths, _ = crop_pose(ANCHOR_IMAGE_PATH, f"{OUTPUT_FOLDER}/anchor")
-
+# ==============================================================================
+# ==== 🚀 MAIN INFERENCE FUNCTION (TỐI ƯU) 🚀 ====
+# ==============================================================================
+def run_inference(test_image_path, model, anchor_gallery):
+    """Hàm kiểm tra chính, nhận model và gallery đã tải làm tham số."""
+    
+    # --- BƯỚC 1: XỬ LÝ ẢNH TEST ---
     print("🔧 Đang crop ảnh test...")
+    os.makedirs(f"{OUTPUT_FOLDER}/test", exist_ok=True)
     test_boxes, test_paths, test_image = crop_pose(test_image_path, f"{OUTPUT_FOLDER}/test")
+    if test_image is None:
+        return None, {"error": "Failed to process test image."}
 
+    # --- BƯỚC 2: SO SÁNH VÀ ĐÁNH GIÁ ---
+    # Vòng lặp này giờ sẽ tự động xử lý "helmet" vì nó đã có trong `labels`
     results = {}
-    early_fail = False
-
     for label in labels:
-        if label in ["left_arm", "right_arm"]:
-            continue  # bỏ kiểm tra tay áo ở bước này, sẽ kiểm tra sau nếu shirt pass
-        if label == "nametag":
-            if early_fail:
-                results[label] = "fail"
-                continue
-            result, nametag_box = detect_nametag_better(test_paths.get(label))
-            offset = test_boxes["nametag"]
-            if nametag_box:
-                x1_crop, y1_crop, x2_crop, y2_crop = nametag_box
-                x1 = offset["x1"] + x1_crop
-                y1 = offset["y1"] + y1_crop
-                x2 = offset["x1"] + x2_crop
-                y2 = offset["y1"] + y2_crop
+        result = "missing"
+        emb_test = extract_embedding(test_paths.get(label), model)
+        gallery = anchor_gallery.get(label)
+
+        if emb_test is not None and gallery:
+            similarities = [cosine_similarity(emb_test, emb_anchor)[0][0] for emb_anchor in gallery]
+            max_sim = max(similarities)
+            current_threshold = THRESHOLDS.get(label, THRESHOLDS["default"])
+            
+            print(f"[{label.upper():<12}] - Max Similarity: {max_sim:.4f} (Threshold: {current_threshold})")
+            result = "pass" if max_sim >= current_threshold else "fail"
         else:
-            emb_anchor = extract_embedding(anchor_paths.get(label))
-            emb_test = extract_embedding(test_paths.get(label))
-            result = "missing"
-            if emb_anchor is not None and emb_test is not None:
-                sim = cosine_similarity(emb_anchor, emb_test)[0][0]
-                result = "pass" if sim >= THRESHOLD else "fail"
-            if label in ["shirt", "pants"] and result == "fail":
-                early_fail = True
-                # Nếu pants là pass, kiểm tra xem có bị sắn (lộ da) không
-            if label == "pants" and result == "pass":
-                path = test_paths.get("pants")
-                if path is not None:
-                    img = cv2.imread(path)
-                    h = img.shape[0]
-                    start_row = int(h * 2 / 3)
-                    lower_part = img[start_row:, :]
-
-                    hsv = cv2.cvtColor(lower_part, cv2.COLOR_BGR2HSV)
-                    lower = np.array([0, 20, 70], dtype=np.uint8)
-                    upper = np.array([20, 255, 255], dtype=np.uint8)
-                    mask = cv2.inRange(hsv, lower, upper)
-
-                    skin_ratio = np.sum(mask == 255) / mask.size
-                    print(f"[PANTS SẮN] Skin ratio (lower): {skin_ratio:.2%}")
-
-                    if skin_ratio > 0.04:
-                        result = "fail"
-                        # ✅ Tìm contour để vẽ box da vùng ống quần dưới
-                        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        for cnt in contours:
-                            if cv2.contourArea(cnt) < 100:
-                                continue
-                            x, y, w, h = cv2.boundingRect(cnt)
-                            if "pants" in test_boxes:
-                                box = test_boxes["pants"]
-                                x1 = box["x1"] + x
-                                y1 = box["y1"] + start_row + y
-                                x2 = x1 + w
-                                y2 = y1 + h
-                                box_errors.append({
-                                    "label": "pants_rolled_up",
-                                    "box": (x1, y1, x2, y2),
-                                    "color": (0, 0, 255)
-                                })
-
-                results["pants"] = result
-        if label == "shirt" and result == "pass":
-            for arm_label in ["left_arm", "right_arm"]:
-                path = test_paths.get(arm_label)
-                if path is None:
-                    results[arm_label] = "missing"
-                    continue
-
+            print(f"[{label.upper():<12}] - Missing test crop or anchor gallery for this label.")
+        
+        # --- LOGIC KIỂM TRA PHỤ ---
+        if result == "pass" and label in ["pants", "left_arm", "right_arm"]:
+            path = test_paths.get(label)
+            if path and os.path.exists(path):
                 img = cv2.imread(path)
-
-                # Cắt 2/3 dưới ảnh tay để tránh vùng vai
-                h = img.shape[0]
-                roi = img[int(h / 3):, :]  # từ 1/3 chiều cao trở xuống
-
-                # Xử lý HSV trên ROI
-                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-                lower = np.array([0, 20, 70], dtype=np.uint8)
-                upper = np.array([20, 255, 255], dtype=np.uint8)
-                mask = cv2.inRange(hsv, lower, upper)
-                skin_ratio = np.sum(mask == 255) / mask.size
-
-                print(f"[{arm_label.upper()}] skin ratio: {skin_ratio:.2%}")
-
-                if skin_ratio > 0.04:
-                    results[arm_label] = "fail"
-                    if arm_label in test_boxes:
-                        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        for cnt in contours:
-                            if cv2.contourArea(cnt) < 100:
-                                continue
-                            x, y, w, h = cv2.boundingRect(cnt)
-                            box = test_boxes[arm_label]
-                            x1 = box["x1"] + x
-                            y1 = box["y1"] + int(h / 3) + y
-                            x2 = x1 + w
-                            y2 = y1 + h
-                            box_errors.append({
-                                "label": f"{arm_label}_skin",
-                                "box": (x1, y1, x2, y2),
-                                "color": (0, 0, 255)
-                            })
-                else:
-                    results[arm_label] = "pass"
-
+                h_img = img.shape[0]
+                start_row = int(h_img * (2/3 if label == 'pants' else 1/2))
+                check_area = img[start_row:, :]
+                if check_area.size > 0:
+                    hsv = cv2.cvtColor(check_area, cv2.COLOR_BGR2HSV)
+                    lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+                    upper_skin = np.array([20, 255, 255], dtype=np.uint8)
+                    mask = cv2.inRange(hsv, lower_skin, upper_skin)
+                    skin_ratio = np.sum(mask == 255) / mask.size if mask.size > 0 else 0
+                    print(f"  -> [{label.upper()}] Skin check. Ratio: {skin_ratio:.2%}")
+                    if skin_ratio > 0.05:
+                        print(f"  -> !!! Phát hiện da, kết quả cho '{label}' chuyển thành FAIL.")
+                        result = "fail"
         results[label] = result
 
-        # 🎨 Vẽ khung lên ảnh
-        if result == "fail":
-            color = colors["fail"]
-            if label == "nametag" and nametag_box:
-                cv2.rectangle(test_image, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(test_image, f"{label}: {result}", (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            elif label in test_boxes:
-                box = test_boxes[label]
-                cv2.rectangle(test_image, (box["x1"], box["y1"]), (box["x2"], box["y2"]), color, 2)
-                cv2.putText(test_image, f"{label}: {result}", (box["x1"], box["y1"] - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        # --- VẼ KẾT QUẢ LÊN ẢNH ---
+        if result == "fail" and label in test_boxes:
+            box = test_boxes[label]
+            cv2.rectangle(test_image, (box["x1"], box["y1"]), (box["x2"], box["y2"]), colors["fail"], 2)
+            cv2.putText(test_image, f"{label}: fail", (box["x1"], box["y1"] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors["fail"], 2)
 
-    if box_errors:
-        for err in box_errors:
-            x1, y1, x2, y2 = err["box"]
-            color = err["color"]
-            cv2.rectangle(test_image, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(test_image, f"{err['label']}", (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-    # ==== 💾 OUTPUT ====
+    # --- LƯU KẾT QUẢ ---
     output_path = os.path.join(OUTPUT_FOLDER, "test_result.jpg")
     cv2.imwrite(output_path, test_image)
-
+    
     return output_path, results
+
+if __name__ == '__main__':
+    # BẠN HÃY THAY ĐƯỜNG DẪN NÀY
+    TEST_IMAGE_FILE = "path/to/your/test_image.jpg" 
+    
+    if not os.path.exists(GALLERY_FILE_PATH):
+        print(f"❌ Lỗi: Không tìm thấy file gallery '{GALLERY_FILE_PATH}'.")
+        print("➡️ Vui lòng chạy script `create_anchor_gallery.py` trước để tạo file này.")
+    elif not os.path.exists(TEST_IMAGE_FILE):
+        print(f"❌ Lỗi: Không tìm thấy file ảnh test tại '{TEST_IMAGE_FILE}'")
+        print("➡️ Vui lòng cập nhật biến TEST_IMAGE_FILE trong code.")
+    else:
+        print("🧠 Đang tải model MobileNetV2...")
+        inference_model = tf.keras.applications.MobileNetV2(include_top=False, weights='imagenet', input_shape=(224, 224, 3), pooling='avg')
+        print("✅ Model đã sẵn sàng.")
+        
+        print(f"📚 Đang tải bộ sưu tập anchor từ '{GALLERY_FILE_PATH}'...")
+        with open(GALLERY_FILE_PATH, 'rb') as f:
+            loaded_anchor_gallery = pickle.load(f)
+        print("✅ Tải gallery thành công.")
+
+        print("\n🚀 Bắt đầu kiểm tra ảnh test...")
+        output, final_results = run_inference(TEST_IMAGE_FILE, inference_model, loaded_anchor_gallery)
+        
+        if output:
+            print(f"\n✅ Xử lý hoàn tất. Kết quả được lưu tại: {output}")
+            print("================== KẾT QUẢ KIỂM TRA =================")
+            print(json.dumps(final_results, indent=2, ensure_ascii=False))
+            print("=====================================================")

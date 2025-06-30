@@ -1,0 +1,186 @@
+# create_anchor_gallery.py
+
+import os
+import cv2
+import numpy as np
+import tensorflow as tf
+import albumentations as A
+import mediapipe as mp
+import pickle
+
+# ==============================================================================
+# ==== ⚙️ CONFIG (Cấu hình cho việc tạo gallery) ====
+# ==============================================================================
+ANCHOR_IMAGES_FOLDER = "anchors_cropped"
+OUTPUT_FOLDER = "check"
+GALLERY_SAVE_PATH = "anchor_gallery.pkl" 
+N_AUGMENTATIONS = 10 
+RESIZED_SHAPE = (512, 1024)
+# THAY ĐỔI: Thêm "helmet" vào danh sách labels
+labels = [ "nametag", "shirt", "pants", "left_glove", "right_glove", "left_shoe", "right_shoe", "left_arm", "right_arm"]
+
+# ==============================================================================
+# ==== 🧠 HELPER FUNCTIONS (Các hàm xử lý cần thiết) ====
+# ==============================================================================
+def _preprocess_image_for_embedding(img):
+    """Hàm phụ để tiền xử lý ảnh trước khi đưa vào model."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_eq = clahe.apply(l)
+    lab_eq = cv2.merge((l_eq, a, b))
+    img_rgb = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+    return tf.keras.applications.mobilenet_v2.preprocess_input(img_rgb)
+
+def extract_robust_anchor_embedding(image_path, n_augmentations, model):
+    """Trích xuất embedding vững chắc, nhận model làm tham số."""
+    if not image_path or not os.path.exists(image_path): return None
+    img = cv2.imread(image_path)
+    if img is None: return None
+    img = cv2.resize(img, (224, 224))
+    augmentor = A.Compose([
+        A.RandomBrightnessContrast(brightness_limit=0.25, contrast_limit=0.25, p=0.9)
+    ])
+    embeddings = []
+    original_processed = _preprocess_image_for_embedding(img.copy())
+    embeddings.append(model.predict(np.expand_dims(original_processed, axis=0), verbose=0))
+    for _ in range(n_augmentations - 1):
+        augmented = augmentor(image=img.copy())['image']
+        augmented_processed = _preprocess_image_for_embedding(augmented)
+        embeddings.append(model.predict(np.expand_dims(augmented_processed, axis=0), verbose=0))
+    return np.mean(embeddings, axis=0)
+
+def crop_pose(image_path, save_folder):
+    """Cắt các bộ phận từ ảnh dựa trên các điểm pose."""
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"    ❌ Không thể đọc ảnh: {image_path}")
+        return {}, {}
+    image = cv2.resize(image, RESIZED_SHAPE)
+    h, w, _ = image.shape
+    mp_pose = mp.solutions.pose
+    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
+        results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    if not results.pose_landmarks:
+        print(f"    ❌ Không phát hiện người trong ảnh: {image_path}")
+        return {}, {}
+    landmarks = results.pose_landmarks.landmark
+    def get_point(lm): return int(lm.x * w), int(lm.y * h)
+    crops, crop_paths = {}, {}
+    def save_crop(label, x1, y1, x2, y2):
+        if 0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h:
+            crop = image[y1:y2, x1:x2]
+            path = os.path.join(save_folder, f"crop_{label}.jpg")
+            cv2.imwrite(path, crop)
+            crops[label] = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+            crop_paths[label] = path
+
+    # --- MỚI: Logic crop mũ bảo hiểm ---
+    # Lấy các điểm trên mặt để xác định vùng đầu
+    # head_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] # Mũi, mắt, tai, miệng
+    # head_landmarks = [landmarks[i] for i in head_indices]
+    # head_xs = [int(l.x * w) for l in head_landmarks]
+    # head_ys = [int(l.y * h) for l in head_landmarks]
+    
+    # if head_xs and head_ys:
+    #     fx1, fy1 = min(head_xs), min(head_ys)
+    #     fx2, fy2 = max(head_xs), max(head_ys)
+    #     fh = fy2 - fy1 # Chiều cao của mặt
+    #     fw = fx2 - fx1 # Chiều rộng của mặt
+        
+    #     # Mở rộng vùng crop lên trên để lấy trọn mũ
+    #     # và mở rộng ra hai bên một chút
+    #     helmet_x1 = fx1 - int(fw * 0.2)
+    #     helmet_y1 = fy1 - int(fh * 1.0) # Mở rộng lên trên bằng chiều cao mặt
+    #     helmet_x2 = fx2 + int(fw * 0.2)
+    #     helmet_y2 = fy2 # Giữ nguyên phần dưới của mặt
+    #     save_crop("helmet", helmet_x1, helmet_y1, helmet_x2, helmet_y2)
+
+    # --- Logic crop các bộ phận khác (giữ nguyên) ---
+    ls, rs = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER], landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+    lw, rw = landmarks[mp_pose.PoseLandmark.LEFT_WRIST], landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
+    la, ra = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE], landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
+    lh, rh = landmarks[mp_pose.PoseLandmark.LEFT_HIP], landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
+    
+    x1, y1 = get_point(ls); x2, y2 = get_point(rs)
+    cx1 = int((x1 + x2) * 0.5); cx2 = max(x1, x2) + 20
+    cy1 = int((y1 + y2) * 0.5 + 0.08 * h)-20; cy2 = cy1 + 100
+    save_crop("nametag", cx1, cy1, cx2, cy2)
+    def crop_hand(label, ids):
+        pts = [landmarks[i] for i in ids]
+        xs = [int(p.x * w) for p in pts]; ys = [int(p.y * h) for p in pts]
+        margin_x, margin_y = 30, 50
+        save_crop(label, min(xs) - margin_x, min(ys) - margin_y, max(xs) + margin_x, max(ys) + margin_y)
+    crop_hand("left_glove", [mp_pose.PoseLandmark.LEFT_WRIST, mp_pose.PoseLandmark.LEFT_PINKY, mp_pose.PoseLandmark.LEFT_INDEX])
+    crop_hand("right_glove", [mp_pose.PoseLandmark.RIGHT_WRIST, mp_pose.PoseLandmark.RIGHT_PINKY, mp_pose.PoseLandmark.RIGHT_INDEX])
+    for label, pt in zip(["left_shoe", "right_shoe"], [la, ra]):
+        px, py = get_point(pt)
+        save_crop(label, px - 50, py - 20, px + 50, py + 60)
+    x_ls, y_ls = get_point(ls); x_rs, y_rs = get_point(rs)
+    shirt_x1 = min(x_ls, x_rs) - 20; shirt_y1 = min(y_ls, y_rs) - 40
+    shirt_x2 = max(x_ls, x_rs) + 20; shirt_y2 = int((lh.y + rh.y) / 2 * h)
+    save_crop("shirt", shirt_x1, shirt_y1, shirt_x2, shirt_y2)
+    lx, ly = get_point(lh); rx, ry = get_point(rh)
+    ankle_y = max(get_point(la)[1], get_point(ra)[1])
+    save_crop("pants", min(lx, rx) - 80, min(ly, ry), max(lx, rx) + 80, ankle_y + 40)
+    for label, shoulder, wrist in zip(["left_arm", "right_arm"], [ls, rs], [lw, rw]):
+        sx, sy = get_point(shoulder); wx, wy = get_point(wrist)
+        save_crop(label, min(sx, wx) - 30, min(sy, wy) - 30, max(sx, wx) + 30, max(sy, wy) + 30)
+    return crops, crop_paths
+
+# ==============================================================================
+# ==== 🚀 MAIN SCRIPT LOGIC 🚀 ====
+# ==============================================================================
+def create_gallery():
+    """Hàm chính để tạo và lưu anchor gallery."""
+    print("🧠 Đang tải model MobileNetV2...")
+    ml_model = tf.keras.applications.MobileNetV2(include_top=False, weights='imagenet', input_shape=(224, 224, 3), pooling='avg')
+    print("✅ Model đã sẵn sàng.")
+
+    print(f"\n🔧 Bắt đầu xử lý các ảnh anchor từ thư mục: '{ANCHOR_IMAGES_FOLDER}'")
+    anchor_image_files = [f for f in os.listdir(ANCHOR_IMAGES_FOLDER) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+    if not anchor_image_files:
+        print(f"❌ Lỗi: Không tìm thấy ảnh nào trong thư mục anchor '{ANCHOR_IMAGES_FOLDER}'.")
+        return
+
+    all_anchor_crop_paths = {label: [] for label in labels}
+    for idx, filename in enumerate(anchor_image_files):
+        anchor_path = os.path.join(ANCHOR_IMAGES_FOLDER, filename)
+        print(f"  -> Đang crop ảnh anchor {idx+1}/{len(anchor_image_files)}: {filename}")
+        anchor_save_folder = os.path.join(OUTPUT_FOLDER, "anchor", f"anchor_{idx:03d}")
+        os.makedirs(anchor_save_folder, exist_ok=True)
+        _, anchor_paths = crop_pose(anchor_path, anchor_save_folder)
+        for label, path in anchor_paths.items():
+            if label in all_anchor_crop_paths:
+                all_anchor_crop_paths[label].append(path)
+
+    print("\n🧠 Đang tạo bộ sưu tập anchor embedding... (Quá trình này có thể mất một lúc)")
+    anchor_gallery = {}
+    for label, crop_paths_list in all_anchor_crop_paths.items():
+        if not crop_paths_list:
+            print(f"  - Cảnh báo: Không có ảnh crop nào cho '{label}'. Bỏ qua.")
+            continue
+        
+        gallery_for_label = []
+        for i, path in enumerate(crop_paths_list):
+            print(f"    -> Trích xuất embedding cho '{label}' - mẫu {i+1}/{len(crop_paths_list)}")
+            emb = extract_robust_anchor_embedding(path, N_AUGMENTATIONS, ml_model)
+            if emb is not None:
+                gallery_for_label.append(emb)
+        
+        if gallery_for_label:
+            anchor_gallery[label] = gallery_for_label
+            print(f"  -> Đã tạo xong gallery cho '{label}' với {len(gallery_for_label)} mẫu.")
+
+    if not anchor_gallery:
+        print("❌ Không tạo được gallery. Vui lòng kiểm tra lại ảnh anchor và quá trình crop.")
+        return
+
+    print(f"\n💾 Đang lưu bộ sưu tập embedding vào file: {GALLERY_SAVE_PATH}")
+    with open(GALLERY_SAVE_PATH, 'wb') as f:
+        pickle.dump(anchor_gallery, f)
+    
+    print(f"✅ Hoàn tất! File '{GALLERY_SAVE_PATH}' đã được tạo thành công.")
+
+if __name__ == '__main__':
+    create_gallery()
