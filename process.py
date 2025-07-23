@@ -22,7 +22,7 @@ helmet_model.eval()
 ANCHOR_IMAGE_PATH = "anchors_cropped/anchor_019.jpg"
 OUTPUT_FOLDER = "check"
 RESIZED_SHAPE = (512, 1024)
-THRESHOLD_HELMET = 0.55  # hoặc giá trị khác như 0.8 nếu cần nghiêm ngặt hơn
+THRESHOLD_HELMET = 0.52  # hoặc giá trị khác như 0.8 nếu cần nghiêm ngặt hơn
 # Load mô hình phát hiện nụ cười
 smile_model = tf.keras.models.load_model("Smile_Detection/Smile_Detection/output/smile.h5")  # đổi tên nếu khác
 face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1)
@@ -100,17 +100,20 @@ def detect_nametag_better(image_path, bright_threshold=170, ratio_thresh=0.03, a
 
     return ("pass" if (white_ratio > ratio_thresh or found) else "fail"), best_box
 
+import cv2
+import numpy as np
+
 def evaluate_shirt_color_hsv_direct(img, save_path=None):
     img = cv2.resize(img, (800, int(img.shape[0] * 800 / img.shape[1])))
-
     h_img, w_img = img.shape[:2]
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    lower_orange = np.array([3, 80, 80])
-    upper_orange = np.array([25, 255, 255])
+    # Ngưỡng màu
+    lower_orange = np.array([0, 70, 70])
+    upper_orange = np.array([30, 255, 255])
     blue_range = (np.array([95, 30, 35]), np.array([135, 255, 255]))
 
-    # ROI giống như demo.py: vùng giữa ngực nơi hay có sọc cam
+    # ROI phần ngực (sọc cam)
     top = int(h_img * 0.18)
     bottom = int(h_img * 0.42)
     left = int(w_img * 0.05)
@@ -122,31 +125,39 @@ def evaluate_shirt_color_hsv_direct(img, save_path=None):
     roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_CLOSE, kernel)
 
     contours, _ = cv2.findContours(roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    roi_area = roi.shape[0] * roi.shape[1]
+
     if not contours:
-        if save_path is not None:
+        if save_path:
             debug_img = img.copy()
-            cv2.putText(debug_img, "No orange contour detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8, (0, 0, 255), 2)
+            cv2.putText(debug_img, "No orange detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             cv2.imwrite(save_path, debug_img)
         return "fail"
 
     largest_cnt = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest_cnt) < 150:
-        if save_path is not None:
+    cam_area = cv2.contourArea(largest_cnt)
+
+    # Kiểm tra chặt hơn: diện tích + tỉ lệ + mật độ pixel cam
+    x, y, w_box, h_box = cv2.boundingRect(largest_cnt)
+    aspect_ratio = w_box / h_box if h_box > 0 else 0
+    cam_pixel_ratio = np.sum(roi_mask > 0) / roi_area
+
+    if (cam_area / roi_area < 0.02) or (aspect_ratio < 2.0) or (cam_pixel_ratio < 0.01):
+        if save_path:
             debug_img = img.copy()
-            cv2.putText(debug_img, "Contour too small", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8, (0, 0, 255), 2)
+            cv2.putText(debug_img, "CAM too small/short/insufficient", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             cv2.imwrite(save_path, debug_img)
         return "fail"
 
-    x, y, w_box, h_box = cv2.boundingRect(largest_cnt)
+    # Xác định lại vùng cam tuyệt đối
     x_abs = x + left
     y_abs = y + top
-
     cam_roi = hsv[y_abs:y_abs + h_box, x_abs:x_abs + w_box]
     cam_mask = cv2.inRange(cam_roi, lower_orange, upper_orange)
     cam_mean = np.array(cv2.mean(cam_roi, mask=cam_mask)[:3])
 
+    # Kiểm tra vùng xanh bên dưới
     bot_hsv = hsv[y_abs + h_box:, x_abs:x_abs + w_box]
     bot_mean = np.array(cv2.mean(bot_hsv)[:3])
 
@@ -154,20 +165,21 @@ def evaluate_shirt_color_hsv_direct(img, save_path=None):
         lower, upper = color_range
         return np.all(color >= lower) and np.all(color <= upper)
 
-    cam_match = np.sum(cam_mask) > 0
+    cam_match = np.sum(cam_mask > 0) > 0
     bottom_match = in_range(bot_mean, blue_range)
 
     result = "pass" if cam_match and bottom_match else "fail"
 
-    if save_path is not None:
+    # Vẽ debug nếu cần
+    if save_path:
         debug_img = img.copy()
 
-        # Vẽ vùng CAM
+        # CAM
         cv2.rectangle(debug_img, (x_abs, y_abs), (x_abs + w_box, y_abs + h_box), (0, 165, 255), 2)
         cv2.putText(debug_img, "CAM", (x_abs, y_abs - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (0, 165, 255), 1)
 
-        # Vẽ vùng XANH (bottom)
+        # BLUE
         cv2.rectangle(debug_img, (x_abs, y_abs + h_box), (x_abs + w_box, h_img), (255, 0, 0), 2)
         cv2.putText(debug_img, "BLUE", (x_abs, y_abs + h_box + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (255, 0, 0), 1)
@@ -183,6 +195,7 @@ def evaluate_shirt_color_hsv_direct(img, save_path=None):
         cv2.imwrite(save_path, debug_img)
 
     return result
+
 # ==== 📌 POSE CROP ====
 def crop_pose(image_path, save_folder):
     image = cv2.imread(image_path)
@@ -434,24 +447,7 @@ def run_inference(test_image_path):
     all_labels = labels.copy()
 
     for label in all_labels:
-        if label in ["left_shoe", "right_shoe"]:
-            path = test_paths.get(label)
-            if path is None:
-                result = "missing"
-            else:
-                img = cv2.imread(path)
-                if img is None:
-                    result = "missing"
-                else:
-                    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-                    lower = np.array([0, 20, 70], dtype=np.uint8)
-                    upper = np.array([20, 255, 255], dtype=np.uint8)
-                    mask = cv2.inRange(hsv, lower, upper)
-                    skin_ratio = np.sum(mask == 255) / mask.size
-                    print(f"[{label.upper()}] Skin ratio (shoe): {skin_ratio:.2%}")
-                    result = "fail" if skin_ratio > 0.05 else "pass"
-
-            results[label] = result
+        
         if label in ["left_arm", "right_arm"]:
             continue  # bỏ kiểm tra tay áo ở bước này, sẽ kiểm tra sau nếu shirt pass
         if label in ["left_glove", "right_glove"]:
@@ -533,6 +529,7 @@ def run_inference(test_image_path):
                 if shirt_img is not None:
                     debug_path = os.path.join(OUTPUT_FOLDER, "test", "shirt_debug.jpg")
                     result = evaluate_shirt_color_hsv_direct(shirt_img, save_path=debug_path)
+                    results["shirt"] = result
             if label in ["shirt", "pants"] and result == "fail":
                 early_fail = True
                 # Nếu pants là pass, kiểm tra xem có bị sắn (lộ da) không
@@ -597,10 +594,33 @@ def run_inference(test_image_path):
                                     test_boxes["pants_rolled_up"] = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
                                     all_labels.append("pants_rolled_up")
                                     results["pants_rolled_up"] = "fail"
+                                    box_errors.append({
+                                        "label": "pants_rolled_up",
+                                        "box": (x1, y1, x2, y2),
+                                        "color": (0, 0, 255)
+                                    })
                                 else:
                                     print("❌ Bỏ qua vùng da không nằm trên chân")
 
                 results["pants"] = result
+        if label in ["left_shoe", "right_shoe"]:
+            path = test_paths.get(label)
+            if path is None:
+                result = "missing"
+            else:
+                img = cv2.imread(path)
+                if img is None:
+                    result = "missing"
+                else:
+                    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+                    lower = np.array([0, 20, 70], dtype=np.uint8)
+                    upper = np.array([20, 255, 255], dtype=np.uint8)
+                    mask = cv2.inRange(hsv, lower, upper)
+                    skin_ratio = np.sum(mask == 255) / mask.size
+                    print(f"[{label.upper()}] Skin ratio (shoe): {skin_ratio:.2%}")
+                    result = "fail" if skin_ratio > 0.05 else "pass"
+
+            results[label] = result
         if label == "shirt" and result == "pass":
             for arm_label in ["left_arm", "right_arm"]:
                 path = test_paths.get(arm_label)
@@ -623,7 +643,7 @@ def run_inference(test_image_path):
 
                 print(f"[{arm_label.upper()}] skin ratio: {skin_ratio:.2%}")
 
-                if skin_ratio > 0.01:
+                if skin_ratio > 0.1:
                     results[arm_label] = "fail"
                     if arm_label in test_boxes:
                         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -643,21 +663,31 @@ def run_inference(test_image_path):
                             })
                 else:
                     results[arm_label] = "pass"
-        results[label] = result
-
+                    
+        # results[label] = result
+        DRAW_FAIL_LABELS = [
+    "nametag", "left_glove", "right_glove",
+    "pants", "pants_rolled_up", "left_arm_skin", "right_arm_skin",
+    "left_shoe", "right_shoe", "shirt", "helmet"
+]
         # 🎨 Vẽ khung lên ảnh
-        if result == "fail":
+        if result == "fail" and label in DRAW_FAIL_LABELS and label in test_boxes:
             color = colors["fail"]
-            if label == "nametag" and label in test_boxes:
-                box = test_boxes[label]
-                cv2.rectangle(test_image, (box["x1"], box["y1"]), (box["x2"], box["y2"]), color, 2)
-                cv2.putText(test_image, f"{label}: {result}", (box["x1"], box["y1"] - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            elif label in test_boxes:
-                box = test_boxes[label]
-                cv2.rectangle(test_image, (box["x1"], box["y1"]), (box["x2"], box["y2"]), color, 2)
-                cv2.putText(test_image, f"{label}: {result}", (box["x1"], box["y1"] - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            box = test_boxes[label]
+            cv2.rectangle(test_image, (box["x1"], box["y1"]), (box["x2"], box["y2"]), color, 2)
+            cv2.putText(test_image, f"{label}: {result}", (box["x1"], box["y1"] - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        # === Vẽ thêm tất cả các lỗi phụ từ box_errors ===
+        for error in box_errors:
+            err_label = error["label"]
+            if err_label not in DRAW_FAIL_LABELS:
+                continue  # bỏ qua các lỗi không cần vẽ
+            x1, y1, x2, y2 = error["box"]
+            color = error.get("color", (0, 0, 255))
+            cv2.rectangle(test_image, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(test_image, err_label, (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     # ==== HELMET CHECK ====
     helmet_path = test_paths.get("helmet")
     if helmet_path is not None:

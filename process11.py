@@ -1,0 +1,702 @@
+import os
+import cv2
+import json
+import numpy as np
+import mediapipe as mp
+import tensorflow as tf
+from sklearn.metrics.pairwise import cosine_similarity
+import torch
+from torchvision import transforms
+from PIL import Image
+from ultralytics import YOLO
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing.image import img_to_array
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+
+# Load mô hình helmet
+helmet_model = YOLO("best2.pt")
+helmet_model.eval()
+
+
+# ==== ⚙️ CONFIG ====
+RESIZED_SHAPE = (512, 1024)
+THRESHOLD_HELMET = 0.35
+# Load mô hình phát hiện nụ cười
+smile_model = tf.keras.models.load_model("Smile_Detection/Smile_Detection/output/smile.h5")  # đổi tên nếu khác
+face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1)
+
+# ==== 🧠 MODEL ====
+model = tf.keras.applications.MobileNetV2(include_top=False, weights='imagenet',
+                                          input_shape=(224, 224, 3), pooling='avg')
+
+
+def extract_embedding(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+    img = cv2.resize(img, (224, 224))
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_eq = clahe.apply(l)
+    lab_eq = cv2.merge((l_eq, a, b))
+    img = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+
+    img = tf.keras.applications.mobilenet_v2.preprocess_input(img)
+    img = np.expand_dims(img, axis=0)
+    return model.predict(img, verbose=0)
+
+
+# ==== 📦 LABELS + COLOR ====
+labels = ["nametag", "shirt", "pants", "left_glove", "right_glove",
+          "left_shoe", "right_shoe", "left_arm", "right_arm"]
+colors = {"pass": (0, 255, 0), "fail": (0, 0, 255), "missing": (128, 128, 128)}
+
+
+# ===NAMETAG===
+
+def detect_nametag_better(img, bright_threshold=170, ratio_thresh=0.03, area_thresh=300, show=True):
+    if img is None:
+        print("❌ Không có ảnh nametag để kiểm tra")
+        return "missing", None
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Threshold để tìm vùng sáng (thẻ tên)
+    _, binary = cv2.threshold(gray, bright_threshold, 255, cv2.THRESH_BINARY)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    white_ratio = 0.0
+    largest_area = 0
+    best_box = None
+    found = False
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > largest_area:
+            largest_area = area
+            x, y, w, h = cv2.boundingRect(cnt)
+            best_box = (x, y, x + w, y + h)
+            found = area > area_thresh
+
+    if largest_area > 0.5:
+        white_ratio = largest_area / binary.size
+        print(f"🔍 Bright pixel ratio (largest cluster): {white_ratio:.2%}")
+
+    if show and found:
+        cv2.rectangle(img, (best_box[0], best_box[1]), (best_box[2], best_box[3]), (0, 255, 0), 2)
+        cv2.putText(img, f"Area: {int(largest_area)}", (best_box[0], best_box[1]-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+    return ("pass" if (white_ratio > ratio_thresh or found) else "fail"), best_box
+
+def evaluate_shirt_color_hsv_direct(img, save_path=None):
+    img = cv2.resize(img, (800, int(img.shape[0] * 800 / img.shape[1])))
+
+    h_img, w_img = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    lower_orange = np.array([3, 80, 80])
+    upper_orange = np.array([25, 255, 255])
+    blue_range = (np.array([95, 30, 35]), np.array([135, 255, 255]))
+
+    # ROI giống như demo.py: vùng giữa ngực nơi hay có sọc cam
+    top = int(h_img * 0.18)
+    bottom = int(h_img * 0.42)
+    left = int(w_img * 0.05)
+    right = int(w_img * 0.95)
+    roi = hsv[top:bottom, left:right]
+
+    kernel = np.ones((5, 5), np.uint8)
+    roi_mask = cv2.inRange(roi, lower_orange, upper_orange)
+    roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        if save_path is not None:
+            debug_img = img.copy()
+            cv2.putText(debug_img, "No orange contour detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0, 0, 255), 2)
+
+        return "fail"
+
+    largest_cnt = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest_cnt) < 150:
+        if save_path is not None:
+            debug_img = img.copy()
+            cv2.putText(debug_img, "Contour too small", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0, 0, 255), 2)
+
+        return "fail"
+
+    x, y, w_box, h_box = cv2.boundingRect(largest_cnt)
+    x_abs = x + left
+    y_abs = y + top
+
+    cam_roi = hsv[y_abs:y_abs + h_box, x_abs:x_abs + w_box]
+    cam_mask = cv2.inRange(cam_roi, lower_orange, upper_orange)
+    cam_mean = np.array(cv2.mean(cam_roi, mask=cam_mask)[:3])
+
+    bot_hsv = hsv[y_abs + h_box:, x_abs:x_abs + w_box]
+    bot_mean = np.array(cv2.mean(bot_hsv)[:3])
+
+    def in_range(color, color_range):
+        lower, upper = color_range
+        return np.all(color >= lower) and np.all(color <= upper)
+
+    cam_match = np.sum(cam_mask) > 0
+    bottom_match = in_range(bot_mean, blue_range)
+
+    result = "pass" if cam_match and bottom_match else "fail"
+
+    if save_path is not None:
+        debug_img = img.copy()
+
+        # Vẽ vùng CAM
+        cv2.rectangle(debug_img, (x_abs, y_abs), (x_abs + w_box, y_abs + h_box), (0, 165, 255), 2)
+        cv2.putText(debug_img, "CAM", (x_abs, y_abs - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (0, 165, 255), 1)
+
+        # Vẽ vùng XANH (bottom)
+        cv2.rectangle(debug_img, (x_abs, y_abs + h_box), (x_abs + w_box, h_img), (255, 0, 0), 2)
+        cv2.putText(debug_img, "BLUE", (x_abs, y_abs + h_box + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (255, 0, 0), 1)
+
+        if result == "fail":
+            if not cam_match:
+                cv2.putText(debug_img, "❌ Sai CAM", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            if not bottom_match:
+                cv2.putText(debug_img, "❌ Sai BLUE (Duoi)", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        else:
+            cv2.putText(debug_img, "✅ Dung mau dong phuc", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
+
+
+
+    return result
+# ==== 📌 POSE CROP ====
+def crop_pose(image_path, save_folder=None):
+
+    image = cv2.imread(image_path)
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(static_image_mode=True)
+    results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+    if not results.pose_landmarks:
+        print(f"❌ Không phát hiện người trong ảnh: {image_path}")
+        return {}, {}, image
+
+    landmarks = results.pose_landmarks.landmark
+    h_raw, w_raw = image.shape[:2]
+    points = [(int(lm.x * w_raw), int(lm.y * h_raw)) for lm in landmarks]
+
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+
+    margin_x = 250
+    margin_y = 600
+
+    x1 = max(min(xs) - margin_x, 0)
+    y1 = max(min(ys) - margin_y, 0)
+    x2 = min(max(xs) + margin_x, w_raw)
+    y2 = min(max(ys) + margin_y, h_raw)
+
+    # Cắt vùng chứa người
+    image = image[y1:y2, x1:x2]
+    image = cv2.resize(image, RESIZED_SHAPE)
+    h, w, _ = image.shape
+
+    # Scale lại landmark theo crop + resize
+    def map_point(lm):
+        abs_x = int(lm.x * w_raw)
+        abs_y = int(lm.y * h_raw)
+        new_x = int((abs_x - x1) * (w / (x2 - x1)))
+        new_y = int((abs_y - y1) * (h / (y2 - y1)))
+        return new_x, new_y
+
+    mapped_landmarks = [map_point(lm) for lm in landmarks]
+
+    def get_point(point):
+        return point[0], point[1]
+
+    crops = {}
+    crop_paths = {}
+
+    def save_crop(label, x1, y1, x2, y2):
+        if 0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h:
+            crop = image[y1:y2, x1:x2]
+            path = os.path.join(save_folder, f"crop_{label}.jpg")
+            crops[label] = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+
+    # Điểm landmark chính
+    ls, rs = mapped_landmarks[11], mapped_landmarks[12]
+    lw, rw = mapped_landmarks[15], mapped_landmarks[16]
+    la, ra = mapped_landmarks[27], mapped_landmarks[28]
+    lh, rh = mapped_landmarks[23], mapped_landmarks[24]
+
+    # Nametag
+    x1, y1 = get_point(ls)
+    x2, y2 = get_point(rs)
+    cx1 = int((x1 + x2) * 0.5)
+    cx2 = max(x1, x2) + 10
+    cy1 = int((y1 + y2) * 0.5 + 0.08 * h)-20
+    cy2 = cy1 + 100 #độ dài
+    save_crop("nametag", cx1, cy1, cx2, cy2)
+
+    # Găng tay
+    def crop_hand(label, ids):
+        pts = [mapped_landmarks[i] for i in ids]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        margin_x, margin_y = 30, 50
+        save_crop(label, min(xs) - margin_x, min(ys) - margin_y, max(xs) + margin_x, max(ys) + margin_y)
+
+    crop_hand("left_glove", [15, 17, 19, 21])
+    crop_hand("right_glove", [16, 18, 20, 22])
+
+    # Giày
+    for label, pt in zip(["left_shoe", "right_shoe"], [la, ra]):
+        px, py = get_point(pt)
+        save_crop(label, px - 50, py - 20, px + 50, py + 60)
+
+    # Áo
+    x_ls, y_ls = get_point(ls)
+    x_rs, y_rs = get_point(rs)
+    shirt_x1 = min(x_ls, x_rs) - 20
+    shirt_y1 = min(y_ls, y_rs) - 40
+    shirt_x2 = max(x_ls, x_rs) + 20
+    shirt_y2 = int(((lh[1] + rh[1]) / 2))
+    save_crop("shirt", shirt_x1, shirt_y1, shirt_x2, shirt_y2)
+
+    # Quần
+    lx, ly = get_point(lh)
+    rx, ry = get_point(rh)
+    ankle_y = max(la[1], ra[1])
+    save_crop("pants", min(lx, rx) - 80, min(ly, ry), max(lx, rx) + 80, ankle_y + 40)
+
+    # Cánh tay
+    for label, shoulder, wrist in zip(["left_arm", "right_arm"], [ls, rs], [lw, rw]):
+        sx, sy = get_point(shoulder)
+        wx, wy = get_point(wrist)
+        save_crop(label, min(sx, wx) - 30, min(sy, wy) - 30, max(sx, wx) + 30, max(sy, wy) + 30)
+
+
+    # === CROP VÙNG ĐẦU (HELMET) ===
+    head_ids = [0, 1, 2, 3, 4, 5, 6, 7, 8]  # mũi, mắt, miệng, tai
+    head_points = [get_point(mapped_landmarks[i]) for i in head_ids]
+    xs = [p[0] for p in head_points]
+    ys = [p[1] for p in head_points]
+
+    # Mở rộng vùng đầu để lấy cả nón
+    margin_x, margin_y = 60, 70
+    extra_top_margin = 30  # ✅ mở rộng thêm lên phía trên
+
+    x1 = max(min(xs) - margin_x, 0)
+    y1 = max(min(ys) - margin_y - extra_top_margin, 0)
+    x2 = min(max(xs) + margin_x, w)
+    y2 = min(max(ys) + margin_y, h)
+
+    save_crop("helmet", x1, y1, x2, y2)
+
+
+        # === CROP VÙNG MẶT NHỎ HƠN CHỈ DÙNG NHẬN NỤ CƯỜI ===
+        # === CROP VÙNG MẶT (RIÊNG CHO NHẬN DIỆN NỤ CƯỜI) ===
+    face_margin_x = 20
+    top_margin = 40
+    bottom_margin = 70  # 👉 mở rộng thêm phía dưới để chắc chắn có miệng
+
+    fx1 = max(min(xs) - face_margin_x, 0)
+    fy1 = max(min(ys) - top_margin, 0)
+    fx2 = min(max(xs) + face_margin_x, w)
+    fy2 = min(max(ys) + bottom_margin, h)  # 👉 mở rộng xuống dưới
+
+    save_crop("face_smile", fx1, fy1, fx2, fy2)
+
+    return crops, crop_paths, image, landmarks
+
+
+def extract_shirt_colors(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+    img = cv2.resize(img, (300, 300))  # đảm bảo tỷ lệ chuẩn
+
+    h = img.shape[0]
+    top = img[0:int(h/3), :, :]
+    mid = img[int(h/3):int(2*h/3), :, :]
+    bot = img[int(2*h/3):, :, :]
+
+    color_top = np.mean(top.reshape(-1, 3), axis=0)
+    color_mid = np.mean(mid.reshape(-1, 3), axis=0)
+    color_bot = np.mean(bot.reshape(-1, 3), axis=0)
+
+    return {
+        "top": color_top,
+        "mid": color_mid,
+        "bot": color_bot
+    }
+def detect_smile(face_image_path, threshold=0.5):
+    img = cv2.imread(face_image_path)
+    if img is None:
+        return "missing"
+
+    detector = cv2.CascadeClassifier("Smile_Detection/Smile_Detection/haarcascade_frontalface_default.xml")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    rects = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+
+    if len(rects) == 0:
+        return "no_face"
+
+    (fX, fY, fW, fH) = rects[0]
+    roi_color = img[fY:fY + fH, fX:fX + fW]
+    roi_rgb = cv2.cvtColor(roi_color, cv2.COLOR_BGR2RGB)
+    roi_resized = cv2.resize(roi_rgb, (224, 224))
+
+    array_img = img_to_array(roi_resized)
+    array_img = preprocess_input(array_img)
+
+    # landmark môi
+    results = face_mesh.process(roi_rgb)
+    if results.multi_face_landmarks:
+        landmarks = results.multi_face_landmarks[0].landmark
+        left = landmarks[61]
+        right = landmarks[291]
+        top = landmarks[13]
+        bottom = landmarks[14]
+        mouth_width = np.linalg.norm(np.array([left.x, left.y]) - np.array([right.x, right.y]))
+        mouth_height = np.linalg.norm(np.array([top.y]) - np.array([bottom.y]))
+    else:
+        mouth_width, mouth_height = 0.0, 0.0
+
+    combined = np.append(array_img.flatten(), [mouth_width, mouth_height])
+    combined = np.expand_dims(combined, axis=0)
+
+    (not_smile, smile) = smile_model.predict(combined, verbose=0)[0]
+    print(f"🙂 Smile confidence: {smile:.2%} | Not smile: {not_smile:.2%}")
+
+    return "smile" if smile > threshold else "no_smile"
+def intersect_with_leg_line(box, knee, ankle):
+    """
+    Kiểm tra xem bounding box có cắt qua đường thẳng từ đầu gối đến gót chân không.
+
+    Args:
+        box: tuple (x1, y1, x2, y2) – toạ độ vùng da
+        knee: tuple (x, y) – toạ độ đầu gối
+        ankle: tuple (x, y) – toạ độ gót chân
+
+    Returns:
+        True nếu cắt qua, False nếu nằm lệch ngoài
+    """
+    x1, y1, x2, y2 = box
+    x_min, x_max = min(x1, x2), max(x1, x2)
+    y_min, y_max = min(y1, y2), max(y1, y2)
+
+    # Tọa độ điểm đầu và cuối đường trục chân
+    x_knee, y_knee = knee
+    x_ankle, y_ankle = ankle
+
+    # Duyệt theo chiều y, kiểm tra từng điểm trên đường trục
+    for alpha in np.linspace(0, 1, 20):  # kiểm tra 20 điểm trên đoạn thẳng
+        x_line = int((1 - alpha) * x_knee + alpha * x_ankle)
+        y_line = int((1 - alpha) * y_knee + alpha * y_ankle)
+
+        if x_min <= x_line <= x_max and y_min <= y_line <= y_max:
+            return True  # Có giao
+
+    return False  # Không cắt qua
+
+# ==DeLoy==
+def run_inference(test_image_path):
+    # Tạo lại thư mục kết quả
+    box_errors = []
+    # ==== 📌 POSE CROP ====
+    print("🔧 Đang crop ảnh test...")
+    test_boxes, test_paths, test_image, test_landmarks = crop_pose(test_image_path, "unused_folder")
+
+    results = {}
+    early_fail = False
+    all_labels = labels.copy()
+
+    for label in all_labels:
+        if label in ["left_shoe", "right_shoe"]:
+            if label in test_boxes:
+                box = test_boxes[label]
+                x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+                if y2 > y1 and x2 > x1:
+                    img = test_image[y1:y2, x1:x2]
+                    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+                    lower = np.array([0, 20, 70], dtype=np.uint8)
+                    upper = np.array([20, 255, 255], dtype=np.uint8)
+                    mask = cv2.inRange(hsv, lower, upper)
+                    skin_ratio = np.sum(mask == 255) / mask.size
+                    print(f"[{label.upper()}] Skin ratio (shoe): {skin_ratio:.2%}")
+                    result = "fail" if skin_ratio > 0.05 else "pass"
+                else:
+                    result = "missing"
+            else:
+                result = "missing"
+
+            results[label] = result
+        if label in ["left_arm", "right_arm"]:
+            continue  # bỏ kiểm tra tay áo ở bước này, sẽ kiểm tra sau nếu shirt pass
+        if label in ["left_glove", "right_glove"]:
+            if label in test_boxes:
+                box = test_boxes[label]
+                x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+
+                if y2 > y1 and x2 > x1:
+                    img = test_image[y1:y2, x1:x2]
+                    hsv_full = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+                    mask_full = cv2.inRange(hsv_full, np.array([0, 20, 70], dtype=np.uint8),
+                                            np.array([20, 255, 255], dtype=np.uint8))
+                    skin_ratio_full = np.sum(mask_full == 255) / mask_full.size
+                    print(f"[{label.upper()}] skin ratio (full): {skin_ratio_full:.2%}")
+
+                    # Kiểm tra 1/3 dưới ngón tay
+                    h = img.shape[0]
+                    roi = img[int(h * 2 / 3):, :]
+                    hsv_tip = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                    mask_tip = cv2.inRange(hsv_tip, np.array([0, 20, 70], dtype=np.uint8),
+                                           np.array([20, 255, 255], dtype=np.uint8))
+                    skin_ratio_tip = np.sum(mask_tip == 255) / mask_tip.size
+                    print(f"[{label.upper()}] skin ratio (fingertips): {skin_ratio_tip:.2%}")
+
+                    if skin_ratio_full > 0.4:
+                        result = "fail"
+                        box_errors.append({
+                            "label": f"{label}_no_glove",
+                            "box": (x1, y1, x2, y2),
+                            "color": (0, 0, 255)
+                        })
+                    elif skin_ratio_tip > 0.02:
+                        result = "fail"
+                        contours, _ = cv2.findContours(mask_tip, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for cnt in contours:
+                            if cv2.contourArea(cnt) < 100:
+                                continue
+                            cx, cy, cw, ch = cv2.boundingRect(cnt)
+                            x1_new = x1 + cx
+                            y1_new = y1 + int((y2 - y1) * 2 / 3) + cy
+                            x2_new = x1_new + cw
+                            y2_new = y1_new + ch
+                            box_errors.append({
+                                "label": f"{label}_tip_skin",
+                                "box": (x1_new, y1_new, x2_new, y2_new),
+                                "color": (0, 0, 255)
+                            })
+                    else:
+                        result = "pass"
+                else:
+                    result = "missing"
+            else:
+                result = "missing"
+
+            results[label] = result
+        if label == "nametag":
+            if early_fail:
+                results[label] = "fail"
+                continue
+
+            if label in test_boxes:
+                box = test_boxes[label]
+                x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+
+                if y2 > y1 and x2 > x1:
+                    nametag_crop = test_image[y1:y2, x1:x2]
+                    result, nametag_box = detect_nametag_better(nametag_crop)
+                else:
+                    result = "missing"
+                    nametag_box = None
+            else:
+                result = "missing"
+                nametag_box = None
+
+            results[label] = result
+
+
+        else:
+            if label == "shirt":
+                if label in test_boxes:
+                    box = test_boxes[label]
+                    x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+
+                    if y2 > y1 and x2 > x1:
+                        shirt_crop = test_image[y1:y2, x1:x2]
+                        result = evaluate_shirt_color_hsv_direct(shirt_crop)
+                    else:
+                        result = "missing"
+                else:
+                    result = "missing"
+
+            if label in ["shirt", "pants"] and result == "fail":
+                early_fail = True
+                # Nếu pants là pass, kiểm tra xem có bị sắn (lộ da) không
+
+                if "pants" in test_boxes:
+                    box = test_boxes["pants"]
+                    x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+                    if y2 > y1 and x2 > x1:
+                        img = test_image[y1:y2, x1:x2]
+                        result = "pass"
+
+                        # Kiểm tra da sắn
+                        h = img.shape[0]
+                        start_row = int(h * 1 / 2)
+                        lower_part = img[start_row:, :]
+
+                        hsv = cv2.cvtColor(lower_part, cv2.COLOR_BGR2HSV)
+                        lower = np.array([0, 20, 70], dtype=np.uint8)
+                        upper = np.array([20, 255, 255], dtype=np.uint8)
+                        mask = cv2.inRange(hsv, lower, upper)
+
+                        skin_ratio = np.sum(mask == 255) / mask.size
+                        print(f"[PANTS SẮN] Skin ratio (lower): {skin_ratio:.2%}")
+
+                        if skin_ratio > 0.02:
+                            # ======= BỔ SUNG: In ra vị trí vùng da so với đầu gối và gót chân ========
+                            def get_point(lm):  # Convert landmark to pixel
+                                return int(lm.x * test_image.shape[1]), int(lm.y * test_image.shape[0])
+
+                            left_knee = get_point(test_landmarks[25])
+                            right_knee = get_point(test_landmarks[26])
+                            left_ankle = get_point(test_landmarks[27])
+                            right_ankle = get_point(test_landmarks[28])
+
+                            print(f"LEFT_KNEE: {left_knee}")
+                            print(f"RIGHT_KNEE: {right_knee}")
+                            print(f"LEFT_ANKLE: {left_ankle}")
+                            print(f"RIGHT_ANKLE: {right_ankle}")
+
+                            if label in test_boxes:
+                                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                for cnt in contours:
+                                    if cv2.contourArea(cnt) < 50:
+                                        continue
+                                    x, y, w, h_cnt = cv2.boundingRect(cnt)
+                                    box = test_boxes["pants"]
+                                    x1 = box["x1"] + x
+                                    y1 = box["y1"] + start_row + y
+                                    x2 = x1 + w
+                                    y2 = y1 + h_cnt
+                                    region_box = (x1, y1, x2, y2)
+
+                                    # 🧠 Kiểm tra có giao với trục chân không
+                                    if intersect_with_leg_line(region_box, left_knee, left_ankle) or \
+                                            intersect_with_leg_line(region_box, right_knee, right_ankle):
+                                        print("✅ Vùng da giao với chân → là lỗi thật")
+                                        test_boxes["pants_rolled_up"] = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+                                        all_labels.append("pants_rolled_up")
+                                        results["pants_rolled_up"] = "fail"
+                                    else:
+                                        print("❌ Bỏ qua vùng da không nằm trên chân")
+
+                    else:
+                        result = "missing"
+                else:
+                    result = "missing"
+
+                results["pants"] = result
+        if label == "shirt" and result == "pass":
+            for arm_label in ["left_arm", "right_arm"]:
+                if arm_label in test_boxes:
+                    box = test_boxes[arm_label]
+                    x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+                    if y2 > y1 and x2 > x1:
+                        img = test_image[y1:y2, x1:x2]
+                    else:
+                        results[arm_label] = "missing"
+                        continue
+                else:
+                    results[arm_label] = "missing"
+                    continue
+
+                # Cắt 2/3 dưới ảnh tay để tránh vùng vai
+                h = img.shape[0]
+                roi = img[int(h / 3):, :]  # từ 1/3 chiều cao trở xuống
+
+                # Xử lý HSV trên ROI
+                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                lower = np.array([0, 20, 70], dtype=np.uint8)
+                upper = np.array([20, 255, 255], dtype=np.uint8)
+                mask = cv2.inRange(hsv, lower, upper)
+                skin_ratio = np.sum(mask == 255) / mask.size
+
+                print(f"[{arm_label.upper()}] skin ratio: {skin_ratio:.2%}")
+
+                if skin_ratio > 0.01:
+                    results[arm_label] = "fail"
+                    if arm_label in test_boxes:
+                        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for cnt in contours:
+                            if cv2.contourArea(cnt) < 100:
+                                continue
+                            x, y, w, h = cv2.boundingRect(cnt)
+                            box = test_boxes[arm_label]
+                            x1 = box["x1"] + x
+                            y1 = box["y1"] + int(h / 3) + y
+                            x2 = x1 + w
+                            y2 = y1 + h
+                            box_errors.append({
+                                "label": f"{arm_label}_skin",
+                                "box": (x1, y1, x2, y2),
+                                "color": (0, 0, 255)
+                            })
+                else:
+                    results[arm_label] = "pass"
+        results[label] = result
+
+        # 🎨 Vẽ khung lên ảnh
+        if result == "fail":
+            color = colors["fail"]
+            if label == "nametag" and label in test_boxes:
+                box = test_boxes[label]
+                cv2.rectangle(test_image, (box["x1"], box["y1"]), (box["x2"], box["y2"]), color, 2)
+                cv2.putText(test_image, f"{label}: {result}", (box["x1"], box["y1"] - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            elif label in test_boxes:
+                box = test_boxes[label]
+                cv2.rectangle(test_image, (box["x1"], box["y1"]), (box["x2"], box["y2"]), color, 2)
+                cv2.putText(test_image, f"{label}: {result}", (box["x1"], box["y1"] - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    # ==== HELMET CHECK ====
+    if "helmet" in test_boxes:
+        box = test_boxes["helmet"]
+        x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+        if y2 > y1 and x2 > x1:
+            helmet_crop = test_image[y1:y2, x1:x2]
+            results_helmet = helmet_model(helmet_crop)[0]
+        # YOLO trả về list, lấy phần đầu
+        names = results_helmet.names  # danh sách class names
+        detected = False
+
+        for box in results_helmet.boxes:
+            cls_id = int(box.cls[0].item())
+            cls_name = names[cls_id].lower()
+            print("Helmet Detection:", cls_name)
+            conf = float(box.conf[0])  # lấy độ tự tin
+            print(f"🪖 Helmet Detection: {cls_name}, Confidence: {conf:.2%}")
+            if "helmet" in cls_name and conf >= THRESHOLD_HELMET:
+                detected = True
+                break
+
+        if detected:
+            results["helmet"] = "pass"
+        else:
+            results["helmet"] = "fail"
+            box = test_boxes.get("helmet")
+            if box:
+                x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+                cv2.rectangle(test_image, (x1, y1), (x2, y2), colors["fail"], 2)
+                cv2.putText(test_image, "helmet: fail", (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors["fail"], 2)
+    else:
+        results["helmet"] = "missing"
+    face_path = test_image_path  # dùng vùng head đã crop
+    if face_path is not None:
+        smile_result = detect_smile(face_path)
+        results["smile"] = smile_result
+    else:
+        results["smile"] = "missing"
+    # ==== 💾 OUTPUT ====
+
+    return test_image, results
