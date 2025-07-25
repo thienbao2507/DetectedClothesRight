@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <title>Kết quả kiểm tra đồng phục</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 p-6 font-sans">
+<div class="text-center mb-8">
+  <h1 class="text-3xl font-bold text-gray-800">🎓 Kết quả kiểm tra đồng phục</h1>
+</div>
+
+<div class="flex gap-6">
+  <!-- CỘT TRÁI: Ảnh kết quả -->
+  <div class="w-1/5 bg-white shadow rounded-lg p-4">
+    <h2 class="text-lg font-semibold text-gray-700 mb-3">📷 Ảnh đã xử lý</h2>
+    <img src="{{ img_path }}" alt="Ảnh kết quả" class="rounded border border-gray-300" />
+  </div>
+
+  <!-- CỘT GIỮA: Icon kiểm tra -->
+<div class="w-1/6 bg-[#FC942D] shadow rounded-lg p-4">
+  <h2 class="text-xl font-bold text-gray-800 mb-4">📋 KIỂM TRA</h2>
+
+  {% set total_fail = 0 %}
+
+  {% for item in ['left_glove', 'right_glove', 'left_shoe', 'right_shoe', 'nametag', 'shirt', 'pants', 'helmet'] %}
+    {% if results[item] != 'pass' %}
+      {% set total_fail = total_fail + 1 %}
+    {% endif %}
+  {% endfor %}
+
+  <p class="text-red-600 font-bold text-lg mb-4">Total Fail: {{ total_fail }}</p>
+
+  <div class="grid grid-cols-2 gap-6 justify-items-center">
+    <!-- Helmet -->
+    <div class="flex flex-col items-center">
+      <img src="{{ url_for('static', filename='icons/helmet.png') }}"
+           class="w-12 h-12 mb-1
+           {% if results['helmet'] == 'pass' %}
+              filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+           {% else %}
+              opacity-30
+           {% endif %}">
+      <span class="text-sm text-gray-700">Helmet</span>
+    </div>
+
+    <!-- ID -->
+    <div class="flex flex-col items-center">
+      <img src="{{ url_for('static', filename='icons/id-card.png') }}"
+           class="w-12 h-12 mb-1
+           {% if results['nametag'] == 'pass' %}
+              filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+           {% else %}
+              opacity-30
+           {% endif %}">
+      <span class="text-sm text-gray-700">ID</span>
+    </div>
+
+    <!-- Shirt -->
+    <div class="flex flex-col items-center">
+      <img src="{{ url_for('static', filename='icons/long-sleeve-shirt.png') }}"
+           class="w-12 h-12 mb-1
+           {% if results['shirt'] == 'pass' %}
+              filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+           {% else %}
+              opacity-30
+           {% endif %}">
+      <span class="text-sm text-gray-700">Shirt</span>
+    </div>
+
+    <!-- Pants -->
+    <div class="flex flex-col items-center">
+      <img src="{{ url_for('static', filename='icons/pants.png') }}"
+           class="w-12 h-12 mb-1
+           {% if results['pants'] == 'pass' %}
+              filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+           {% else %}
+              opacity-30
+           {% endif %}">
+      <span class="text-sm text-gray-700">Pants</span>
+    </div>
+
+    <!-- Left Glove -->
+    <div class="flex flex-col items-center">
+      <img src="{{ url_for('static', filename='icons/left_glove.png') }}"
+           class="w-12 h-12 mb-1
+           {% if results['left_glove'] == 'pass' %}
+              filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+           {% else %}
+              opacity-30
+           {% endif %}">
+      <span class="text-sm text-gray-700">Left Glove</span>
+    </div>
+
+    <!-- Right Glove -->
+    <div class="flex flex-col items-center">
+      <img src="{{ url_for('static', filename='icons/right_glove.png') }}"
+           class="w-12 h-12 mb-1
+           {% if results['right_glove'] == 'pass' %}
+              filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+           {% else %}
+              opacity-30
+           {% endif %}">
+      <span class="text-sm text-gray-700">Right Glove</span>
+    </div>
+
+    <!-- Left Shoe -->
+    <div class="flex flex-col items-center">
+      <img src="{{ url_for('static', filename='icons/left_shoe.png') }}"
+           class="w-12 h-12 mb-1
+           {% if results['left_shoe'] == 'pass' %}
+              filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+           {% else %}
+              opacity-30
+           {% endif %}">
+      <span class="text-sm text-gray-700">Left Shoe</span>
+    </div>
+
+    <!-- Right Shoe -->
+    <div class="flex flex-col items-center">
+      <img src="{{ url_for('static', filename='icons/right_shoe.png') }}"
+           class="w-12 h-12 mb-1
+           {% if results['right_shoe'] == 'pass' %}
+              filter brightness-0 saturate-100 invert sepia hue-rotate-30 drop-shadow-lg
+           {% else %}
+              opacity-30
+           {% endif %}">
+      <span class="text-sm text-gray-700">Right Shoe</span>
+    </div>
+  </div>
+</div>
+
+  <!-- CỘT PHẢI: JSON -->
+  <div class="w-1/2 bg-white shadow rounded-lg p-4">
+    <h2 class="text-lg font-semibold text-gray-700 mb-3">📊 Kết quả JSON</h2>
+    <pre class="bg-gray-100 p-3 rounded text-sm text-gray-800 overflow-x-auto">{{ results | tojson(indent=2) }}</pre>
+  </div>
+</div>
+
+</body>
+</html>
