@@ -25,18 +25,18 @@ RESIZED_SHAPE = (512, 1024)
 
 # HSV Ranges
 HSV_SKIN = (np.array([0, 20, 70], dtype=np.uint8), np.array([20, 255, 255], dtype=np.uint8))
-HSV_SHOE = (np.array([0, 40, 90]), np.array([18, 150, 255]))
+HSV_SHOE = (np.array([0, 60, 90]), np.array([15, 140, 255]))
 
 # Thresholds
-THRESH_SKIN_SHOE = 0.06
+THRESH_SKIN_SHOE = 0.4
 THRESH_SKIN_GLOVE_FULL = 0.4
-THRESH_SKIN_GLOVE_TIP = 0.02
+THRESH_SKIN_GLOVE_TIP = 0.35
 THRESH_SKIN_ARM = 0.1
 THRESH_SKIN_PANTS = 0.02
 THRESH_HELMET_CONF = 0.70
 THRESH_SMILE_CONF = 0.5
 THRESH_NAMETAG_BRIGHT = 170
-THRESH_NAMETAG_RATIO = 0.03
+THRESH_NAMETAG_RATIO = 0.025
 THRESH_NAMETAG_AREA = 300
 
 
@@ -122,9 +122,25 @@ def detect_nametag_better(image_input, bright_threshold=THRESH_NAMETAG_BRIGHT,
     return ("pass" if (white_ratio > ratio_thresh or found) else "fail"), best_box
 
 
-import cv2
-import numpy as np
+def intersect_with_line(box, p1, p2):
+    """
+    Kiểm tra xem bounding box có cắt qua đường thẳng p1–p2 không.
+    box: (x1, y1, x2, y2)
+    p1, p2: (x, y) điểm đầu – cuối (ví dụ: vai -> cổ tay)
+    """
+    x1, y1, x2, y2 = box
+    x_min, x_max = min(x1, x2), max(x1, x2)
+    y_min, y_max = min(y1, y2), max(y1, y2)
 
+    x_p1, y_p1 = p1
+    x_p2, y_p2 = p2
+
+    for alpha in np.linspace(0, 1, 20):  # kiểm tra 20 điểm trên line
+        x_line = int((1 - alpha) * x_p1 + alpha * x_p2)
+        y_line = int((1 - alpha) * y_p1 + alpha * y_p2)
+        if x_min <= x_line <= x_max and y_min <= y_line <= y_max:
+            return True
+    return False
 
 def evaluate_shirt_color_hsv_direct(img, save_path=None):
     img = cv2.resize(img, (800, int(img.shape[0] * 800 / img.shape[1])))
@@ -489,8 +505,9 @@ def run_inference(test_image_path):
             else:
                 # === Kiểm tra toàn bàn tay
                 hsv_full = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-                mask_full = cv2.inRange(hsv_full, np.array([0, 20, 70], dtype=np.uint8),
-                                        np.array([20, 255, 255], dtype=np.uint8))
+                mask_full = cv2.inRange(hsv_full,
+                                        np.array([0, 40, 80], dtype=np.uint8),
+                                        np.array([20, 180, 255], dtype=np.uint8))
                 skin_ratio_full = np.sum(mask_full == 255) / mask_full.size
                 print(f"[{label.upper()}] skin ratio (full): {skin_ratio_full:.2%}")
 
@@ -656,8 +673,7 @@ def run_inference(test_image_path):
 
                 print(f"[{arm_label.upper()}] skin ratio: {skin_ratio:.2%}")
 
-                if skin_ratio > THRESH_SKIN_ARM :
-                    results[arm_label] = "fail"
+                if skin_ratio > THRESH_SKIN_ARM:
                     if arm_label in test_boxes:
                         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                         for cnt in contours:
@@ -669,11 +685,32 @@ def run_inference(test_image_path):
                             y1 = box["y1"] + int(h / 3) + y
                             x2 = x1 + w
                             y2 = y1 + h_box
-                            box_errors.append({
-                                "label": f"{arm_label}_skin",
-                                "box": (x1, y1, x2, y2),
-                                "color": (0, 0, 255)
-                            })
+                            region_box = (x1, y1, x2, y2)
+
+                            # ✅ Lấy landmark vai & cổ tay
+                            if arm_label == "left_arm":
+                                shoulder = test_landmarks[11]  # left_shoulder
+                                wrist = test_landmarks[15]  # left_wrist
+                            else:
+                                shoulder = test_landmarks[12]  # right_shoulder
+                                wrist = test_landmarks[16]  # right_wrist
+
+                            def get_point(lm):
+                                return int(lm.x * test_image.shape[1]), int(lm.y * test_image.shape[0])
+
+                            shoulder_pt = get_point(shoulder)
+                            wrist_pt = get_point(wrist)
+
+                            # ✅ Kiểm tra vùng da có giao với line vai–cổ tay không
+                            if intersect_with_line(region_box, shoulder_pt, wrist_pt):
+                                results[arm_label] = "fail"
+                                box_errors.append({
+                                    "label": f"{arm_label}_skin",
+                                    "box": region_box,
+                                    "color": (0, 0, 255)
+                                })
+                            else:
+                                print(f"❌ {arm_label} vùng da không giao với cánh tay → bỏ qua")
                 else:
                     results[arm_label] = "pass"
 
