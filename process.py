@@ -30,13 +30,13 @@ HSV_SHOE = (np.array([0, 60, 90]), np.array([15, 140, 255]))
 # Thresholds
 THRESH_SKIN_SHOE = 0.4
 THRESH_SKIN_GLOVE_FULL = 0.4
-THRESH_SKIN_GLOVE_TIP = 0.35
+THRESH_SKIN_GLOVE_TIP = 0.55
 THRESH_SKIN_ARM = 0.1
 THRESH_SKIN_PANTS = 0.02
-THRESH_HELMET_CONF = 0.70
+THRESH_HELMET_CONF = 0.65
 THRESH_SMILE_CONF = 0.5
 THRESH_NAMETAG_BRIGHT = 170
-THRESH_NAMETAG_RATIO = 0.025
+THRESH_NAMETAG_RATIO = 0.02
 THRESH_NAMETAG_AREA = 300
 
 
@@ -49,6 +49,59 @@ face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_face
 # ==== 🧠 MODEL ====
 model = tf.keras.applications.MobileNetV2(include_top=False, weights='imagenet',
                                           input_shape=(224, 224, 3), pooling='avg')
+
+
+def preprocess_person_crop(image_path, ratio_thresh=0.3):
+    """
+    Đọc ảnh và kiểm tra người trong ảnh có quá nhỏ không.
+    - Nếu nhỏ hơn ngưỡng ratio_thresh -> crop sát người, trả về ảnh đã crop.
+    - Nếu ok -> trả về ảnh gốc.
+    """
+    print(f"thực hiện kiểm tra ảnh")
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"❌ Không thể đọc ảnh: {image_path}")
+        return None
+
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(static_image_mode=True)
+    results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+    if not results.pose_landmarks:
+        print(f"❌ Không phát hiện người trong ảnh: {image_path}")
+        return image
+
+    h_raw, w_raw = image.shape[:2]
+    landmarks = results.pose_landmarks.landmark
+    xs = [int(lm.x * w_raw) for lm in landmarks]
+    ys = [int(lm.y * h_raw) for lm in landmarks]
+
+    # 📏 Tính bounding box của người
+    person_w = max(xs) - min(xs)
+    person_h = max(ys) - min(ys)
+    person_area = person_w * person_h
+    image_area = w_raw * h_raw
+
+    ratio = person_area / image_area
+    print(f"👤 Person ratio: {ratio:.2%}")
+
+    # 👉 Nếu người quá nhỏ thì crop sát hơn
+    if ratio < ratio_thresh:
+        margin_x = int(person_w * 0.45)
+        margin_y = int(person_h * 0.35)
+
+        x1 = max(min(xs) - margin_x, 0)
+        y1 = max(min(ys) - margin_y, 0)
+        x2 = min(max(xs) + margin_x, w_raw)
+        y2 = min(max(ys) + margin_y, h_raw)
+
+        cropped_img = image[y1:y2, x1:x2]
+        print("📌 Person small → Cropped tighter image as new base.")
+        return cropped_img
+    else:
+        print("✅ Person ratio ok → giữ nguyên ảnh gốc.")
+        return image
+
 
 
 def extract_embedding(image_path):
@@ -238,10 +291,14 @@ def evaluate_shirt_color_hsv_direct(img, save_path=None):
 
 # ==== 📌 POSE CROP ====
 def crop_pose(image_path, save_folder):
+    # Luôn gọi preprocess_person_crop trước
     if isinstance(image_path, np.ndarray):
-        image = image_path
+        # Lưu ảnh tạm để hàm preprocess_person_crop xử lý
+        temp_path = "temp_input.jpg"
+        cv2.imwrite(temp_path, image_path)
+        image = preprocess_person_crop(temp_path, ratio_thresh=0.3)
     else:
-        image = cv2.imread(image_path)
+        image = preprocess_person_crop(image_path, ratio_thresh=0.3)
 
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(static_image_mode=True)
@@ -506,8 +563,8 @@ def run_inference(test_image_path):
                 # === Kiểm tra toàn bàn tay
                 hsv_full = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
                 mask_full = cv2.inRange(hsv_full,
-                                        np.array([0, 40, 80], dtype=np.uint8),
-                                        np.array([20, 180, 255], dtype=np.uint8))
+                                        np.array([0, 60, 80], dtype=np.uint8),
+                                        np.array([18, 160, 255], dtype=np.uint8))
                 skin_ratio_full = np.sum(mask_full == 255) / mask_full.size
                 print(f"[{label.upper()}] skin ratio (full): {skin_ratio_full:.2%}")
 
@@ -515,8 +572,9 @@ def run_inference(test_image_path):
                 h = img.shape[0]
                 roi = img[int(h * 2 / 3):, :]
                 hsv_tip = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-                mask_tip = cv2.inRange(hsv_tip, np.array([0, 20, 70], dtype=np.uint8),
-                                       np.array([20, 255, 255], dtype=np.uint8))
+                mask_tip = cv2.inRange(hsv_tip,
+                                       np.array([0, 60, 80], dtype=np.uint8),
+                                       np.array([18, 160, 255], dtype=np.uint8))
                 skin_ratio_tip = np.sum(mask_tip == 255) / mask_tip.size
                 print(f"[{label.upper()}] skin ratio (fingertips): {skin_ratio_tip:.2%}")
 
