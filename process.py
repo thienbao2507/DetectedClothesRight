@@ -36,7 +36,7 @@ HSV_SKIN_LOOSE = (np.array([0, 30, 60], dtype=np.uint8),  np.array([25, 255, 255
 YCRCB_SKIN     = (np.array([0, 133, 77], dtype=np.uint8), np.array([255, 173, 127], dtype=np.uint8))
 
 # Range to compare with median skin color
-HSV_SKIN_TIGHT = (np.array([3, 40, 60], dtype=np.uint8),  np.array([20, 200, 255], dtype=np.uint8))
+HSV_SKIN_TIGHT = (np.array([4, 40, 60], dtype=np.uint8),  np.array([20, 200, 255], dtype=np.uint8))
 
 # Minimum area ratios to accept a skin hypothesis on the glove crop
 MIN_SKIN_AREA_GLOVE_FULL = 0.015
@@ -606,7 +606,8 @@ def run_inference(test_image_path):
             skin_ratio_tip = float(np.sum(mask_tip > 0)) / mask_tip.size
             median_tip = median_hsv_on_mask(hsv_tip, mask_tip)
             median_tip_is_skin = (median_tip is not None) and hsv_in_range(median_tip, HSV_SKIN_TIGHT)
-
+            print(f"[{label}] full area={skin_ratio_full:.2%}, median={median_full}, in_tight={median_is_skin}")
+            print(f"[{label}]  tip area={skin_ratio_tip:.2%}, median={median_tip},  in_tight={median_tip_is_skin}")
             # Quy tắc quyết định:
             # - Fail nếu (diện tích đủ lớn) VÀ (màu trung vị rơi vào skin HSV chặt).
             full_fail = (skin_ratio_full >= MIN_SKIN_AREA_GLOVE_FULL) and median_is_skin
