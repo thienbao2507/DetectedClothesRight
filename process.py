@@ -36,7 +36,7 @@ HSV_SKIN_LOOSE = (np.array([0, 30, 60], dtype=np.uint8),  np.array([25, 255, 255
 YCRCB_SKIN     = (np.array([0, 133, 77], dtype=np.uint8), np.array([255, 173, 127], dtype=np.uint8))
 
 # Range to compare with median skin color
-HSV_SKIN_TIGHT = (np.array([4, 40, 60], dtype=np.uint8),  np.array([20, 200, 255], dtype=np.uint8))
+HSV_SKIN_TIGHT = (np.array([4, 40, 60], dtype=np.uint8),  np.array([18, 200, 255], dtype=np.uint8))
 
 # Minimum area ratios to accept a skin hypothesis on the glove crop
 MIN_SKIN_AREA_GLOVE_FULL = 0.015
@@ -71,6 +71,29 @@ def median_hsv_on_mask(hsv_img, mask):
 def hsv_in_range(hsv_color, rng):
     lo, hi = rng
     return bool(np.all(hsv_color >= lo) and np.all(hsv_color <= hi))
+
+
+# === Hand landmark indices ===
+HAND_IDXS = {
+    "left_glove":  [15, 17, 19, 21],  # wrist, index, pinky, thumb (MP Pose)
+    "right_glove": [16, 18, 20, 22],
+}
+
+def hand_has_any_point(landmarks, idxs, vis_thresh=0.10):
+    """
+    Trả True nếu tồn tại ÍT NHẤT 1 landmark tay có visibility/presence >= vis_thresh.
+    Không yêu cầu đủ tất cả điểm.
+    """
+    for i in idxs:
+        lm = landmarks[i]
+        vis = getattr(lm, "visibility", 1.0)
+        pres = getattr(lm, "presence", 1.0)
+        if (vis is None): vis = 0.0
+        if (pres is None): pres = 0.0
+        if (vis >= vis_thresh) or (pres >= vis_thresh):
+            return True
+    return False
+
 
 # Load mô hình phát hiện nụ cười
 smile_model = tf.keras.models.load_model("smilemain.h5")  # đổi tên nếu khác
@@ -337,7 +360,7 @@ def crop_pose(image_path, save_folder):
 
     if not results.pose_landmarks:
         print(f"❌ Không phát hiện người trong ảnh: {image_path}")
-        return {}, {}, image
+        return {}, {}, image, None
 
     landmarks = results.pose_landmarks.landmark
     h_raw, w_raw = image.shape[:2]
@@ -577,7 +600,9 @@ def run_inference(test_image_path):
     # ==== 📌 POSE CROP ====
     print("🔧 Đang crop ảnh test...")
     test_boxes, test_crops, test_image, test_landmarks = crop_pose(test_image_path, f"{OUTPUT_FOLDER}/test")
-
+# ✅ Nếu không có người → trả về lỗi mềm cho Flask
+    if test_landmarks is None or len(test_crops) == 0:
+        return None, {"_error": "❌ Không phát hiện người trong ảnh. Vui lòng cung cấp ảnh có người rõ ràng."}
     results = {}
     early_fail = False
     all_labels = labels.copy()
@@ -587,8 +612,22 @@ def run_inference(test_image_path):
         if label in ["left_arm", "right_arm"]:
             continue
         if label in ["left_glove", "right_glove"]:
+            print(f"\n🖐 Landmark points for {label}:")
+            for i in HAND_IDXS[label]:
+                lm = test_landmarks[i]
+                vis = getattr(lm, "visibility", None)
+                pres = getattr(lm, "presence", None)
+                x = int(lm.x * test_image.shape[1])
+                y = int(lm.y * test_image.shape[0])
+                print(f" - ID {i}: (x={x}, y={y}), vis={vis:.2f} pres={pres:.2f}")
+            # ✅ Chỉ cần có ÍT NHẤT 1 landmark tay hiện hữu → xét tiếp
+            if (test_landmarks is None) or (not hand_has_any_point(test_landmarks, HAND_IDXS[label], vis_thresh=0.35)):
+                results[label] = "missing"
+                continue
+
             img = test_crops.get(label)
-            if img is None:
+            # Nếu crop không có/siêu nhỏ → missing
+            if img is None or img.size == 0 or (img.shape[0] * img.shape[1] < 40 * 40):
                 results[label] = "missing"
                 continue
 
